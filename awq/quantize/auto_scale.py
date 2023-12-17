@@ -33,7 +33,7 @@ def get_act_scale(x):
 def scale_ln_fcs(ln, fcs, scales):
     if not isinstance(fcs, list):
         fcs = [fcs]
-    
+
     scales = scales.to(ln.weight.device)
 
     ln.weight.div_(scales)
@@ -55,7 +55,7 @@ def scale_fc_fc(fc1, fc2, scales):
     assert isinstance(fc1, nn.Linear)
     assert isinstance(fc2, nn.Linear)
     # assert fc1.out_features == fc2.in_features
-    
+
     scales = scales.to(fc1.weight.device)
 
     # fc1.weight.div_(scales.view(-1, 1))
@@ -80,7 +80,7 @@ def scale_gelu_fc(gelu, fc, scales):
 
     for p in fc.parameters():
         assert torch.isnan(p).sum() == 0
-    
+
 
 @torch.no_grad()
 def auto_scale_block(module, module_kwargs,
@@ -160,42 +160,18 @@ def auto_scale_block(module, module_kwargs,
 
     scales_list = []  # return the searched scales
 
-    if isinstance(module, OPTDecoderLayer):
-        # attention input
-        scales_list.append(_auto_get_scale(
-            prev_op=module.self_attn_layer_norm,
-            layers=[module.self_attn.q_proj,
-                    module.self_attn.k_proj, module.self_attn.v_proj],
-            inp=input_feat['self_attn.q_proj'],
-            module2inspect=module.self_attn, kwargs=module_kwargs,
-        ))
-        # attn out
-        scales_list.append(_auto_get_scale(
-            prev_op=module.self_attn.v_proj,
-            layers=[module.self_attn.out_proj],
-            inp=input_feat['self_attn.out_proj'],
-        ))
-        # fc1
-        scales_list.append(_auto_get_scale(
-            prev_op=module.final_layer_norm,
-            layers=[module.fc1],
-            inp=input_feat['fc1'],
-        ))
-        # fc2
-        scales_list.append(_auto_get_scale(
-            prev_op=module.fc1,
-            layers=[module.fc2],
-            inp=input_feat['fc2'],
-        ))
-
-    elif isinstance(module, LlamaDecoderLayer):
+    if isinstance(module, LlamaDecoderLayer):
         # attention input
         scales_list.append(_auto_get_scale(
             prev_op=module.input_layernorm,
-            layers=[module.self_attn.q_proj,
-                    module.self_attn.k_proj, module.self_attn.v_proj],
+            layers=[ # sharing the same input scale factor, calculated by activation
+                # larger act leads to larger activation
+                module.self_attn.q_proj,
+                module.self_attn.k_proj,
+                module.self_attn.v_proj],
             inp=input_feat['self_attn.q_proj'],
-            module2inspect=module.self_attn, kwargs=module_kwargs,
+            module2inspect=module.self_attn,
+            kwargs=module_kwargs,
         ))
         # attn out
         # Please refer to https://github.com/mit-han-lab/llm-awq/pull/67#issue-1850622696
@@ -218,151 +194,6 @@ def auto_scale_block(module, module_kwargs,
             layers=[module.mlp.down_proj],
             inp=input_feat['mlp.down_proj'],
         ))
-    
-    elif isinstance(module, BloomBlock):
-        # attention input
-        scales_list.append(_auto_get_scale(
-            prev_op=module.input_layernorm,
-            layers=[module.self_attention.query_key_value],
-            inp=input_feat['self_attention.query_key_value'],
-            module2inspect=module, kwargs=module_kwargs,
-        ))
-        # attn out
-        # Please refer to https://github.com/mit-han-lab/llm-awq/issues/2#issuecomment-1606297469
-        """
-        scales_list.append(_auto_get_scale(
-            prev_op=module.self_attention.query_key_value,
-            layers=[module.self_attention.dense],
-            inp=input_feat['self_attention.dense'],
-        ))
-        """
-        # fc1
-        scales_list.append(_auto_get_scale(
-            prev_op=module.post_attention_layernorm,
-            layers=[module.mlp.dense_h_to_4h],
-            inp=input_feat['mlp.dense_h_to_4h'],
-            module2inspect=module, kwargs=module_kwargs,
-        ))
-        # fc2
-        scales_list.append(_auto_get_scale(
-            prev_op=module.mlp.gelu_impl,
-            layers=[module.mlp.dense_4h_to_h],
-            inp=input_feat['mlp.dense_4h_to_h'],
-        ))
-    elif "mpt" in str(module.__class__).lower():
-        # attention input
-        scales_list.append(_auto_get_scale(
-            prev_op=module.norm_1,
-            layers=[module.attn.Wqkv],
-            inp=input_feat['attn.Wqkv'],
-            module2inspect=module.attn, 
-            kwargs=module_kwargs,
-        ))
-        
-        # attn out
-        scales_list.append(_auto_get_scale(
-            prev_op=module.attn.Wqkv,
-            layers=[module.attn.out_proj],
-            inp=input_feat['attn.out_proj'],
-        ))
-        # fc1
-        scales_list.append(_auto_get_scale(
-            prev_op=module.norm_2,
-            layers=[module.ffn.up_proj],
-            inp=input_feat['ffn.up_proj'],
-            module2inspect=module.ffn,
-        ))
-        # fc2
-        scales_list.append(_auto_get_scale(
-            prev_op=module.ffn.act,
-            layers=[module.ffn.down_proj],
-            inp=input_feat['ffn.down_proj'],
-        ))
-
-    elif "falcon" in str(module.__class__).lower():         
-        # attn out
-        # Haotian: TBD: need to handle repeated scales for MQ
-        """ 
-        scales_list.append(_auto_get_scale(
-            prev_op=module.self_attention.query_key_value,
-            layers=[module.self_attention.dense],
-            inp=input_feat['self_attention.dense'],
-        ))
-        """
-        # fc1, as long as it is scaled, everything is screwed up
-        if "falcon-7b" in str(module.__class__).lower():
-            scales_list.append(_auto_get_scale(
-                prev_op=module.input_layernorm,
-                layers=[module.mlp.dense_h_to_4h, module.self_attention.query_key_value],
-                inp=input_feat['self_attention.query_key_value'],
-                module2inspect=module,
-                kwargs=module_kwargs,
-            ))
-        elif "falcon-40b" in str(module.__class__).lower():
-            scales_list.append(_auto_get_scale(
-                prev_op=module.ln_attn,
-                layers=[module.self_attention.query_key_value],
-                inp=input_feat['self_attention.query_key_value'],
-                module2inspect=module,
-                kwargs=module_kwargs,
-            ))
-            scales_list.append(_auto_get_scale(
-                prev_op=module.ln_mlp,
-                layers=[module.mlp.dense_h_to_4h],
-                inp=input_feat['mlp.dense_h_to_4h'],
-                module2inspect=module,
-                kwargs=module_kwargs,
-            ))
-        else:
-            raise NotImplementedError("Unknown Falcon architecture, currently only falcon-7b and falcon-40b are supported")
-        # fc2
-        scales_list.append(_auto_get_scale(
-            prev_op=module.mlp.act,
-            layers=[module.mlp.dense_4h_to_h],
-            inp=input_feat['mlp.dense_4h_to_h'],
-        ))
-    elif "bigcode" in str(module.__class__).lower():         
-        scales_list.append(_auto_get_scale(
-            prev_op=module.ln_1,
-            layers=[module.attn.c_attn],
-            inp=input_feat['attn.c_attn'],
-            module2inspect=module.attn, 
-            kwargs=module_kwargs,
-        ))
-        # fc1
-        scales_list.append(_auto_get_scale(
-            prev_op=module.ln_2,
-            layers=[module.mlp.c_fc],
-            inp=input_feat['mlp.c_fc'],
-            module2inspect=module.mlp,
-        ))
-        # fc2
-        scales_list.append(_auto_get_scale(
-            prev_op=module.mlp.act,
-            layers=[module.mlp.c_proj],
-            inp=input_feat['mlp.c_proj'],
-        ))
-    elif "neox" in str(module.__class__).lower():         
-        scales_list.append(_auto_get_scale(
-            prev_op=module.input_layernorm,
-            layers=[module.attention.query_key_value],
-            inp=input_feat['attention.query_key_value'],
-            module2inspect=module.attention, 
-            kwargs=module_kwargs,
-        ))
-        # fc1
-        scales_list.append(_auto_get_scale(
-            prev_op=module.post_attention_layernorm,
-            layers=[module.mlp.dense_h_to_4h],
-            inp=input_feat['mlp.dense_h_to_4h'],
-            module2inspect=module.mlp,
-        ))
-        # fc2
-        scales_list.append(_auto_get_scale(
-            prev_op=module.mlp.act,
-            layers=[module.mlp.dense_4h_to_h],
-            inp=input_feat['mlp.dense_4h_to_h'],
-        ))
     else:
         raise NotImplementedError(f"{type(module)} not supported yet!")
 
@@ -377,7 +208,7 @@ def apply_scale(module, scales_list, input_feat_dict=None):
         for layer in layers:
             layer.cuda()
         scales.cuda()
-        
+
         if isinstance(prev_op, nn.Linear):
             assert len(layers) == 1
             scale_fc_fc(prev_op, layers[0], scales)
@@ -390,9 +221,9 @@ def apply_scale(module, scales_list, input_feat_dict=None):
         else:
             raise NotImplementedError(
                 f"prev_op {type(prev_op)} not supported yet!")
-            
+
         # apply the scaling to input feat if given; prepare it for clipping
-        if input_feat_dict is not None:  
+        if input_feat_dict is not None:
             for layer_name in layer_names:
                 inp = input_feat_dict[layer_name]
                 inp.div_(scales.view(1, -1).to(inp.device))
